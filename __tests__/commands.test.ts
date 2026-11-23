@@ -79,8 +79,8 @@ describe(`${reusableWorkflowPath} prow-commands default`, () => {
   const reusable = yaml.load(read(reusableWorkflowPath)) as Reusable
   const defaults = String(reusable.on.workflow_call.inputs['prow-commands'].default).split(/\s+/)
 
-  it('is every handler and label command except /meow, with no alias and no remove form', () => {
-    const expected = [...handlerCommands.filter(cmd => cmd !== '/meow'), ...labelCommands]
+  it('is every handler and label command except the opt-in /meow and /check-cla, with no alias and no remove form', () => {
+    const expected = [...handlerCommands.filter(cmd => cmd !== '/meow' && cmd !== '/check-cla'), ...labelCommands]
     expect([...defaults].sort()).toEqual([...expected].sort())
   })
 })

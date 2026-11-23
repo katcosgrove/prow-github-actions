@@ -202,7 +202,7 @@ function signingComment(overrides: { body?: string, state?: string, pull?: boole
 }
 
 describe('signFromComment', () => {
-  beforeEach(() => utils.setupActionsEnv('/lgtm'))
+  beforeEach(() => utils.setupActionsEnv('/lgtm /check-cla'))
 
   it('ignores, before any request, a comment that is not the phrase, on an issue, on a closed pull request, or by a bot', async () => {
     await expect(signFromComment(signingComment({ body: 'looks good' }))).resolves.toBe('ignored')
@@ -212,11 +212,16 @@ describe('signFromComment', () => {
     await expect(signFromComment(new utils.MockContext({ ...issueCommentEvent, comment: undefined }))).resolves.toBe('ignored')
   })
 
+  it('ignores the phrase, before any request, while /check-cla is not in prow-commands', async () => {
+    utils.setupActionsEnv('/lgtm')
+    await expect(signFromComment(signingComment())).resolves.toBe('ignored')
+  })
+
   it('ignores the phrase where no signatures are configured, or the configuration does not load', async () => {
     serve({ config: '{}\n' })
     await expect(signFromComment(signingComment())).resolves.toBe('ignored')
 
-    utils.setupActionsEnv('/lgtm')
+    utils.setupActionsEnv('/lgtm /check-cla')
     server.use(http.get(utils.contentsUrl('.github/prow.yaml'), () => HttpResponse.json(file('cla: []\n'))))
     await expect(signFromComment(signingComment())).resolves.toBe('ignored')
     expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('cla: not checking the comment for a signature, the configuration could not be loaded: '))
@@ -256,7 +261,7 @@ describe('signFromComment', () => {
 })
 
 describe('signing from handleIssueComment', () => {
-  beforeEach(() => utils.setupActionsEnv('/lgtm'))
+  beforeEach(() => utils.setupActionsEnv('/lgtm /check-cla'))
 
   it('runs the merge gate after a signature and runs no command', async () => {
     serve()
@@ -278,7 +283,7 @@ describe('signing from handleIssueComment', () => {
     await handleIssueComment(signingComment())
     expect(core.setFailed).toHaveBeenCalledWith(expect.stringMatching(/^error handling issue comment: Error: could not record the signature in /))
 
-    utils.setupActionsEnv('/lgtm')
+    utils.setupActionsEnv('/lgtm /check-cla')
     vi.mocked(core.setFailed).mockClear()
     serve()
     vi.mocked(tideOnComment).mockRejectedValueOnce(new Error('gate'))

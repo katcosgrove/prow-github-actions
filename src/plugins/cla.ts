@@ -2,10 +2,9 @@ import type { Octokit } from '@octokit/rest'
 import type { ResolvedCla } from '../utils/config'
 import type { Context } from '../utils/context'
 
-import { Buffer } from 'node:buffer'
 import * as yaml from 'js-yaml'
 import { platform } from '../platform'
-import { decodeContent } from '../utils/base64'
+import { decodeContent, encodeContent } from '../utils/base64'
 import { createComment, createCommentOnce } from '../utils/comments'
 import { claLabels, claSignPhrase, isMapping, loadProwConfig, parseExplicitSource, readSource, resolveCla } from '../utils/config'
 import { getCurrentLabels, labelIssue, removeLabels } from '../utils/labeling'
@@ -20,6 +19,16 @@ export const maxListedCommits = 250
 export { claLabels } from '../utils/config'
 
 const triggerActions = new Set(['opened', 'reopened', 'synchronize'])
+
+/**
+ * claEnabled tells whether the CLA plugin is switched on: `/check-cla` is
+ * listed in `prow-commands` (`PROW_COMMANDS` for the App). Like `/meow` it is
+ * opt-in, so a repository without it pays no configuration read on its
+ * pull request events and conversation comments.
+ */
+export function claEnabled(): boolean {
+  return platform().inputs.get('prow-commands', { required: false }).split(/\s+/).some(command => command.toLowerCase() === '/check-cla')
+}
 
 /** who has signed: GitHub user ids, and the logins of entries that carry no id */
 export interface Signatures {
@@ -73,6 +82,10 @@ export interface ClaVerdict {
  * @param text - the file contents
  */
 export function parseSignatures(source: string, text: string): Signatures {
+  if (text.trim() === '') {
+    throw new Error(`${source}: expected a list of signers, or a mapping with a signedContributors list`)
+  }
+
   let loaded: unknown
   try {
     loaded = yaml.load(text)
@@ -354,7 +367,8 @@ export async function recordSignature(octokit: Octokit, source: string, entry: S
   const { owner, repo, path, ref } = parsed.file
 
   for (let attempt = 1; ; attempt++) {
-    const { data } = await octokit.repos.getContent({ owner, repo, path, ...(ref === undefined ? {} : { ref }) })
+    // unknown first: the response type is a union (file, symlink, directory listing) that isMapping cannot narrow
+    const data: unknown = (await octokit.repos.getContent({ owner, repo, path, ...(ref === undefined ? {} : { ref }) })).data
     if (!isMapping(data) || typeof data.content !== 'string' || typeof data.encoding !== 'string' || typeof data.sha !== 'string') {
       throw new TypeError(`cla signatures: ${path} is not a file`)
     }
@@ -368,7 +382,7 @@ export async function recordSignature(octokit: Octokit, source: string, entry: S
           repo,
           path,
           message,
-          content: Buffer.from(next).toString('base64'),
+          content: encodeContent(next),
           sha: data.sha,
           ...(ref === undefined ? {} : { branch: ref }),
         })
@@ -404,7 +418,7 @@ export async function signFromComment(context: Context = platform().context()): 
   const issue = context.payload.issue
   const comment = context.payload.comment
   const body: string = comment?.body ?? ''
-  if (issue?.pull_request === undefined || issue.state !== 'open' || comment === undefined || comment.user?.type === 'Bot' || !isSignPhrase(body)) {
+  if (issue?.pull_request === undefined || issue.state !== 'open' || comment === undefined || comment.user?.type === 'Bot' || !isSignPhrase(body) || !claEnabled()) {
     return 'ignored'
   }
 
@@ -467,6 +481,10 @@ export async function claOnPullRequest(context: Context = platform().context()):
   const pull = context.payload.pull_request
   if (action === undefined || !triggerActions.has(action) || pull === undefined) {
     platform().log.debug(`cla: skipping ${action} action`)
+    return
+  }
+  if (!claEnabled()) {
+    platform().log.debug('cla: /check-cla is not in prow-commands')
     return
   }
 

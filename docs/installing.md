@@ -177,7 +177,7 @@ Every input is optional. Each maps to the `action.yml` input of the same name.
 
 Input | Default | Meaning
 --- | --- | ---
-`prow-commands` | every built-in command except `/meow` | The [`/commands`](./commands.md) to enable on `issue_comment`. Setting it replaces the list: add `/meow` or a dynamic `/<key>` command here.
+`prow-commands` | every built-in command except `/meow` and `/check-cla` | The [`/commands`](./commands.md) to enable on `issue_comment`. Setting it replaces the list: add `/meow` or a dynamic `/<key>` command here, or `/check-cla` to switch the [CLA plugin](./configuration.md#cla) on.
 `jobs` | `lgtm` | The [jobs](./cron-jobs.md) for `schedule`, `workflow_dispatch` and `push`, and the [PR jobs](./pr-jobs.md) for `pull_request`: `lgtm` merges on the schedule and strips `lgtm` from updated PRs; `sweep` evaluates recently updated PRs (fork PRs under `pull_request`).
 `merge-method` | `merge` | `merge`, `squash` or `rebase`, in any case; anything else is warned about and merges with `merge`. `tide.merge_method` in `prow.yaml` wins. Ignored on a branch that requires a merge queue: the queue's method wins ([merge queues](./automatic-merging.md#merge-queues)).
 `config` | — | An explicit configuration source, `owner/repo:path[@ref]` or an `https://` url ([configuration](./configuration.md#the-config-input)).

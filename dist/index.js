@@ -37445,6 +37445,7 @@ function newRunState() {
         clients: new Map(),
         tideEvaluated: new Set(),
         tokenLogins: new Map(),
+        claSignatures: new Map(),
         warned: new Set(),
     };
 }
@@ -41220,6 +41221,19 @@ function decodeContent(content, encoding) {
     const bytes = Uint8Array.from(atob(content.replace(/\s+/g, '')), char => char.charCodeAt(0));
     return new TextDecoder().decode(bytes);
 }
+/**
+ * encodeContent turns text into the base64 body the contents API takes, as
+ * UTF-8, with the web APIs both the Node and the Worker runtime provide.
+ *
+ * @param text - the file contents
+ */
+function encodeContent(text) {
+    let binary = '';
+    for (const byte of new TextEncoder().encode(text)) {
+        binary += String.fromCharCode(byte);
+    }
+    return btoa(binary);
+}
 
 ;// CONCATENATED MODULE: ./lib/utils/duration.js
 const durationUnits = { ms: 1, s: 1_000, m: 60_000, h: 3_600_000 };
@@ -41264,7 +41278,13 @@ const defaultOwnersTideLabels = ['lgtm', 'approved'];
 // `hold` stays in the deny-list while repositories still carry the pre-do-not-merge/hold label
 const defaultTideMissingLabels = ['do-not-merge/*', 'needs-rebase', 'hold'];
 // top level keys of the new form other than `labels`
-const reservedKeys = ['require_matching_label', 'tide', 'hold', 'blunderbuss', 'approve', 'lgtm', 'sweep', 'authorization'];
+const reservedKeys = ['require_matching_label', 'tide', 'hold', 'blunderbuss', 'approve', 'lgtm', 'sweep', 'authorization', 'cla'];
+const claKeys = ['signatures', 'label_prefix', 'ignore', 'domains', 'allow_bots', 'document', 'instructions'];
+/** a contributor signs by commenting exactly this, the phrase CLA Assistant asks for */
+const claSignPhrase = 'I have read the CLA Document and I hereby sign the CLA';
+// a DNS name of two or more labels, each 1-63 letters, digits or inner hyphens
+const domainPattern = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$/;
+const defaultClaLabelPrefix = 'cla';
 const authorizationPolicies = ['anyone', 'collaborators', 'members', 'trusted'];
 const reviewAuthorizationPolicies = ['members', 'trusted'];
 const authorizationKeys = ['labels', 'hold', 'close', 'review', 'users'];
@@ -41368,16 +41388,16 @@ async function firstFound(probes, octokit) {
     }
     return undefined;
 }
-function parseExplicitSource(input) {
+function parseExplicitSource(input, name = 'config') {
     if (input.startsWith('http://')) {
-        throw new Error('config: http:// sources are not allowed, use https://');
+        throw new Error(`${name}: http:// sources are not allowed, use https://`);
     }
     if (input.startsWith('https://')) {
         return { kind: 'url', input };
     }
     const match = explicitSourcePattern.exec(input);
     if (match === null) {
-        throw new Error(`config: expected owner/repo:path[@ref] or an https:// url, got '${input}'`);
+        throw new Error(`${name}: expected owner/repo:path[@ref] or an https:// url, got '${input}'`);
     }
     const [, owner, repo, path, ref] = match;
     return { kind: 'repo', input, file: { owner, repo, path, ref } };
@@ -41399,6 +41419,32 @@ async function loadExplicitTier(octokit, source) {
     }
     return { source: input, config: parseProwConfig(input, text) };
 }
+/**
+ * readSource reads a file named the way the `config` input names one:
+ * `owner/repo:path[@ref]`, read with the given client, or an `https://` url,
+ * fetched anonymously. A missing file is an error.
+ *
+ * @param octokit - a hydrated github client
+ * @param input - the source, ex: `my-org/cla:signatures.json@main`
+ * @param what - what the file is, for the error messages, ex: `cla signatures`
+ */
+async function readSource(octokit, input, what) {
+    const source = parseExplicitSource(input, what);
+    if (source.kind === 'url') {
+        return fetchUrl(input, what);
+    }
+    let text;
+    try {
+        text = await fetchRepoFile(octokit, source.file);
+    }
+    catch (e) {
+        throw new Error(`could not load ${what} from ${input}: ${e}`);
+    }
+    if (text === undefined) {
+        throw new Error(`could not load ${what} from ${input}: not found`);
+    }
+    return text;
+}
 // resolves to undefined when the repository or the file does not exist
 async function fetchRepoFile(octokit, file) {
     let data;
@@ -41416,16 +41462,16 @@ async function fetchRepoFile(octokit, file) {
     }
     return decodeContent(data.content, data.encoding);
 }
-async function fetchUrl(url) {
+async function fetchUrl(url, what = 'prow config') {
     let response;
     try {
         response = await fetch(url, { signal: AbortSignal.timeout(5000) });
     }
     catch (e) {
-        throw new Error(`could not load prow config from ${url}: ${e}`);
+        throw new Error(`could not load ${what} from ${url}: ${e}`);
     }
     if (!response.ok) {
-        throw new Error(`could not load prow config from ${url}: HTTP ${response.status}`);
+        throw new Error(`could not load ${what} from ${url}: HTTP ${response.status}`);
     }
     return response.text();
 }
@@ -41492,6 +41538,9 @@ function parseProwConfig(source, text) {
     }
     if (loaded.authorization !== undefined) {
         config.authorization = normalizeAuthorization(source, loaded.authorization);
+    }
+    if (loaded.cla !== undefined) {
+        config.cla = normalizeCla(source, loaded.cla);
     }
     const unknown = Object.keys(loaded).filter(key => key !== 'labels' && !reservedKeys.includes(key));
     if (unknown.length > 0) {
@@ -41737,9 +41786,63 @@ function normalizeAuthorization(source, raw) {
         users,
     });
 }
+function normalizeCla(source, raw) {
+    if (!isMapping(raw)) {
+        throw new Error(`${source}: cla must be a mapping`);
+    }
+    const unknown = Object.keys(raw).find(key => !claKeys.includes(key));
+    if (unknown !== undefined) {
+        throw new Error(`${source}: cla.${unknown} is not a known key, expected one of ${claKeys.join(', ')}`);
+    }
+    if (raw.signatures !== undefined) {
+        if (typeof raw.signatures !== 'string' || raw.signatures.trim() === '') {
+            throw new Error(`${source}: cla.signatures must be owner/repo:path[@ref] or an https:// url`);
+        }
+        // refuse a malformed source when the configuration loads, not on the first pull request
+        parseExplicitSource(raw.signatures.trim(), `${source}: cla.signatures`);
+    }
+    if (raw.label_prefix !== undefined && (typeof raw.label_prefix !== 'string' || raw.label_prefix.trim() === '')) {
+        throw new Error(`${source}: cla.label_prefix must be a non-empty string`);
+    }
+    const ignore = raw.ignore === undefined ? undefined : normalizeLogins(raw.ignore);
+    if (ignore === null) {
+        throw new Error(`${source}: cla.ignore must be a list of logins`);
+    }
+    const domains = raw.domains === undefined ? undefined : normalizeDomains(raw.domains);
+    if (domains === null) {
+        throw new Error(`${source}: cla.domains must be a list of email domains, ex: example.com or *.example.com`);
+    }
+    if (raw.allow_bots !== undefined && typeof raw.allow_bots !== 'boolean') {
+        throw new Error(`${source}: cla.allow_bots must be a boolean`);
+    }
+    if (raw.document !== undefined && (typeof raw.document !== 'string' || !/^https:\/\/\S+$/.test(raw.document.trim()))) {
+        throw new Error(`${source}: cla.document must be an https:// url`);
+    }
+    if (raw.instructions !== undefined && typeof raw.instructions !== 'string') {
+        throw new Error(`${source}: cla.instructions must be a string`);
+    }
+    return stripUndefined({
+        signatures: raw.signatures?.trim(),
+        label_prefix: raw.label_prefix?.trim(),
+        ignore,
+        domains,
+        allow_bots: raw.allow_bots,
+        document: raw.document?.trim(),
+        instructions: raw.instructions,
+    });
+}
 // a GitHub login, or a GitHub App's `<slug>[bot]`; no leading `@`, no inner spaces
 const loginPattern = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\[bot\])?$/;
 // the trimmed logins, or null when the value is not a list of valid logins
+// lower-cased, a leading `@` dropped; null when any entry is not a domain or a `*.` wildcard of one
+function normalizeDomains(value) {
+    if (!isStringList(value)) {
+        return null;
+    }
+    const domains = value.map(entry => entry.trim().toLowerCase().replace(/^@/, ''));
+    const valid = domains.every(domain => domainPattern.test(domain.startsWith('*.') ? domain.slice(2) : domain));
+    return valid ? [...new Set(domains)] : null;
+}
 function normalizeLogins(value) {
     if (!isStringList(value)) {
         return null;
@@ -41759,7 +41862,7 @@ function resolveSweepLookback(sweep) {
 /**
  * mergeProwConfig layers `over` on top of `base`: label sections replace per
  * key, require_matching_label rules concatenate, tide, hold, blunderbuss,
- * approve, lgtm, sweep and authorization shallow-merge, except that
+ * approve, lgtm, sweep, authorization and cla shallow-merge, except that
  * `authorization.users` is the union of both tiers.
  *
  * @param base - the lower precedence tier
@@ -41776,6 +41879,7 @@ function mergeProwConfig(base, over) {
         lgtm: { ...base.lgtm, ...over.lgtm },
         sweep: { ...base.sweep, ...over.sweep },
         authorization: mergeAuthorization(base.authorization, over.authorization),
+        cla: { ...base.cla, ...over.cla },
     };
 }
 // a repository adds its own trusted logins to the organization's instead of replacing them
@@ -41849,6 +41953,32 @@ function resolveAuthorization(authorization) {
         review: authorization.review ?? defaultAuthorization.review,
         users: (authorization.users ?? defaultAuthorization.users).map(login => login.toLowerCase()),
     };
+}
+/**
+ * resolveCla applies the defaults to a merged cla section: labels prefixed
+ * `cla`, bots allowed, nobody ignored. The check is off while `signatures` is
+ * unset.
+ *
+ * @param cla - the merged cla section
+ */
+function resolveCla(cla) {
+    return {
+        signatures: cla.signatures,
+        label_prefix: cla.label_prefix ?? defaultClaLabelPrefix,
+        ignore: (cla.ignore ?? []).map(login => login.toLowerCase()),
+        domains: cla.domains ?? [],
+        allow_bots: cla.allow_bots ?? true,
+        document: cla.document,
+        instructions: cla.instructions,
+    };
+}
+/**
+ * claLabels names the two labels the CLA check manages.
+ *
+ * @param settings - the resolved cla section
+ */
+function claLabels(settings) {
+    return { yes: `${settings.label_prefix}: yes`, no: `${settings.label_prefix}: no` };
 }
 function isMapping(value) {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -43833,7 +43963,8 @@ const needsLabelColor = 'ededed';
  * sections (prefixed `<key>/<value>`, the `/label` allowlist verbatim), the
  * built-in `/lifecycle`, `/stage` and `/status` values where the yaml has no
  * section, the labels the action's own commands apply (`hold.label` and
- * the legacy `hold`, `ok-to-test`), and every `require_matching_label` missing label. Names are unique
+ * the legacy `hold`, `ok-to-test`), every `require_matching_label` missing label,
+ * and the two CLA labels when `cla.signatures` is set. Names are unique
  * case-insensitively (first definition wins) and sorted.
  *
  * @param config - the merged prow configuration
@@ -43858,6 +43989,11 @@ function desiredLabels(config) {
     }
     for (const rule of config.require_matching_label) {
         labels.push({ name: rule.missing_label });
+    }
+    const cla = resolveCla(config.cla);
+    if (cla.signatures !== undefined) {
+        const { yes, no } = claLabels(cla);
+        labels.push({ name: yes, color: 'bfe5bf', description: 'Every commit author of the PR has signed the CLA.' }, { name: no, color: 'e11d21', description: 'A commit author of the PR has not signed the CLA.' });
     }
     const seen = new Set();
     const unique = labels.filter((label) => {
@@ -45527,12 +45663,438 @@ async function reviewedBy(octokit, context, pullNumber) {
     }
 }
 
+;// CONCATENATED MODULE: ./lib/plugins/cla.js
+
+
+
+
+
+
+
+/** the commit status the check sets on the head commit, for branch protection to require */
+const claStatusContext = 'prow/cla';
+/** `GET /pulls/{n}/commits` lists at most this many commits; a longer pull request cannot be verified */
+const maxListedCommits = 250;
+
+const triggerActions = new Set(['opened', 'reopened', 'synchronize']);
+/**
+ * claEnabled tells whether the CLA plugin is switched on: `/check-cla` is
+ * listed in `prow-commands` (`PROW_COMMANDS` for the App). Like `/meow` it is
+ * opt-in, so a repository without it pays no configuration read on its
+ * pull request events and conversation comments.
+ */
+function claEnabled() {
+    return platform_platform().inputs.get('prow-commands', { required: false }).split(/\s+/).some(command => command.toLowerCase() === '/check-cla');
+}
+/**
+ * coveredByDomain tells whether an email address is at one of the corporate
+ * CLA domains: `example.com` matches `a@example.com` only, `*.example.com`
+ * matches `a@eng.example.com` but not `a@example.com`.
+ *
+ * @param email - the commit author email
+ * @param domains - the resolved, lower-cased `cla.domains`
+ */
+function coveredByDomain(email, domains) {
+    const at = email?.lastIndexOf('@') ?? -1;
+    if (email === undefined || at < 1) {
+        return false;
+    }
+    const host = email.slice(at + 1).toLowerCase();
+    return domains.some(domain => domain.startsWith('*.') ? host.endsWith(domain.slice(1)) : host === domain);
+}
+/**
+ * parseSignatures reads a signatures file, JSON or YAML: a top-level list,
+ * or a mapping with a `signedContributors` list (the CLA Assistant format).
+ * An entry is a login, or a mapping with a `login` or `name` and/or a
+ * numeric `id`. An entry with an id matches by id only, so a renamed account
+ * still matches and a newcomer who takes over an old login does not; an
+ * entry without one matches by login, case-insensitively.
+ *
+ * @param source - where the text came from, for the error messages
+ * @param text - the file contents
+ */
+function parseSignatures(source, text) {
+    if (text.trim() === '') {
+        throw new Error(`${source}: expected a list of signers, or a mapping with a signedContributors list`);
+    }
+    let loaded;
+    try {
+        loaded = load(text);
+    }
+    catch (e) {
+        throw new Error(`${source}: could not parse the signatures: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    const list = Array.isArray(loaded)
+        ? loaded
+        : isMapping(loaded) && Array.isArray(loaded.signedContributors) ? loaded.signedContributors : undefined;
+    if (list === undefined) {
+        throw new Error(`${source}: expected a list of signers, or a mapping with a signedContributors list`);
+    }
+    const signatures = { ids: new Set(), logins: new Set() };
+    list.forEach((entry, index) => {
+        if (typeof entry === 'string' && entry.trim() !== '') {
+            signatures.logins.add(entry.trim().toLowerCase());
+            return;
+        }
+        if (isMapping(entry)) {
+            if (typeof entry.id === 'number' && Number.isSafeInteger(entry.id) && entry.id > 0) {
+                signatures.ids.add(entry.id);
+                return;
+            }
+            const login = typeof entry.login === 'string' ? entry.login : entry.name;
+            if (typeof login === 'string' && login.trim() !== '') {
+                signatures.logins.add(login.trim().toLowerCase());
+                return;
+            }
+        }
+        throw new Error(`${source}: signer ${index + 1} has neither a login nor a numeric id`);
+    });
+    return signatures;
+}
+/**
+ * evaluateCommits decides whether every commit author of a pull request has
+ * signed. Authors on `ignore`, and GitHub Apps while `allow_bots` holds, need
+ * no signature; an author email at one of `domains` stands in for one. A
+ * commit whose email is linked to no GitHub account cannot be matched, so it
+ * fails the check, even at a covered domain: anyone can write any address
+ * into a commit, so the domain only counts once GitHub has tied the address
+ * to an account.
+ *
+ * @param commits - the pull request's commits, as listed by the API
+ * @param signatures - who has signed
+ * @param settings - the resolved cla section
+ */
+function evaluateCommits(commits, signatures, settings) {
+    const missing = new Set();
+    const unlinked = [];
+    for (const commit of commits) {
+        const author = commit.author;
+        if (author === null || author.login === undefined) {
+            unlinked.push(commit.sha.slice(0, 7));
+            continue;
+        }
+        const login = author.login.toLowerCase();
+        if (settings.ignore.includes(login) || (settings.allow_bots && author.type === 'Bot')) {
+            continue;
+        }
+        const signed = (author.id !== undefined && signatures.ids.has(author.id))
+            || signatures.logins.has(login)
+            || coveredByDomain(commit.commit?.author?.email, settings.domains);
+        if (!signed) {
+            missing.add(author.login);
+        }
+    }
+    const truncated = commits.length >= maxListedCommits;
+    const sorted = [...missing].sort((a, b) => a.localeCompare(b));
+    return { signed: sorted.length === 0 && unlinked.length === 0 && !truncated, missing: sorted, unlinked, truncated };
+}
+/**
+ * loadSignatures reads and parses the configured signatures once per run.
+ *
+ * @param octokit - a hydrated github client
+ * @param source - the `cla.signatures` source
+ */
+function loadSignatures(octokit, source) {
+    const cache = platform_platform().state().claSignatures;
+    let pending = cache.get(source);
+    if (pending === undefined) {
+        pending = readSource(octokit, source, 'cla signatures').then(text => parseSignatures(source, text));
+        cache.set(source, pending);
+    }
+    return pending;
+}
+/**
+ * enforceCla checks one pull request: it sets `<prefix>: yes` or
+ * `<prefix>: no` (removing the other), records the verdict as the
+ * `prow/cla` status of the head commit and, when signatures are missing,
+ * comments once per set of missing authors. Nothing is read while
+ * `cla.signatures` is unset.
+ *
+ * @param octokit - a hydrated github client
+ * @param context - the github context of the current action event
+ * @param subject - the pull request and its head commit
+ * @returns the verdict, or undefined when the check is not configured
+ */
+async function enforceCla(octokit, context, subject) {
+    const settings = resolveCla((await loadProwConfig(octokit, context)).cla);
+    if (settings.signatures === undefined) {
+        platform_platform().log.debug('cla: no signatures configured');
+        return undefined;
+    }
+    const [signatures, commits] = await Promise.all([
+        loadSignatures(octokit, settings.signatures),
+        octokit.paginate(octokit.pulls.listCommits, { ...context.repo, pull_number: subject.number, per_page: 100 }),
+    ]);
+    const verdict = evaluateCommits(commits, signatures, settings);
+    platform_platform().log.info(`cla: #${subject.number} ${verdict.signed ? 'signed' : `not signed (${describe(verdict)})`}`);
+    await applyLabels(octokit, context, subject.number, settings, verdict.signed);
+    await octokit.repos.createCommitStatus({
+        ...context.repo,
+        sha: subject.sha,
+        context: claStatusContext,
+        state: verdict.signed ? 'success' : 'failure',
+        description: (verdict.signed ? 'every commit author has signed the CLA' : describe(verdict)).slice(0, 140),
+    });
+    if (!verdict.signed) {
+        await createCommentOnce(octokit, context, subject.number, marker(verdict), message(verdict, settings));
+    }
+    return verdict;
+}
+async function applyLabels(octokit, context, number, settings, signed) {
+    const { yes, no } = claLabels(settings);
+    const [want, drop] = signed ? [yes, no] : [no, yes];
+    const current = (await getCurrentLabels(octokit, context, number)).map(label => label.toLowerCase());
+    const stale = current.includes(drop.toLowerCase()) ? [drop] : [];
+    if (stale.length > 0) {
+        await removeLabels(octokit, context, number, stale);
+    }
+    if (!current.includes(want.toLowerCase())) {
+        await labelIssue(octokit, context, number, [want]);
+    }
+}
+function describe(verdict) {
+    const parts = [];
+    if (verdict.missing.length > 0) {
+        parts.push(`not signed: ${verdict.missing.join(', ')}`);
+    }
+    if (verdict.unlinked.length > 0) {
+        parts.push(`${verdict.unlinked.length} commit(s) by an unlinked email`);
+    }
+    if (verdict.truncated) {
+        parts.push(`more than ${maxListedCommits - 1} commits`);
+    }
+    return parts.join('; ');
+}
+// one comment per distinct reason: a push that changes nothing about who is missing posts nothing new
+function marker(verdict) {
+    const key = [...verdict.missing.map(login => login.toLowerCase()), ...verdict.unlinked, ...(verdict.truncated ? ['truncated'] : [])].join(',');
+    return `<!-- prow-github-actions/cla: ${key} -->`;
+}
+function message(verdict, settings) {
+    const cla = settings.document === undefined ? 'Contributor License Agreement (CLA)' : `[Contributor License Agreement (CLA)](${settings.document})`;
+    const lines = [`Thanks for your pull request. Before it can be merged, every commit author needs to have signed the ${cla}.`, ''];
+    if (verdict.missing.length > 0) {
+        lines.push(`- No signature found for: ${verdict.missing.map(login => `@${login}`).join(', ')}`);
+        if (signable(settings)) {
+            lines.push('', 'To sign, read the CLA, then each person listed above comments on this pull request with exactly:', '', '```', claSignPhrase, '```', '');
+        }
+    }
+    if (verdict.unlinked.length > 0) {
+        lines.push(`- These commits are authored with an email that is not linked to a GitHub account, so they cannot be checked: ${verdict.unlinked.join(', ')}. Add the email to your GitHub account, or amend the commits with one that is.`);
+    }
+    if (verdict.truncated) {
+        lines.push(`- The pull request has ${maxListedCommits} or more commits, more than the check can list. Please split it or squash the commits.`);
+    }
+    if (settings.instructions !== undefined && settings.instructions.trim() !== '') {
+        lines.push('', settings.instructions.trim());
+    }
+    lines.push('', 'Signing re-checks the pull request; after any other fix, comment `/check-cla` to check again.');
+    return lines.join('\n');
+}
+// signatures can be recorded only in a repository file, not at an https url
+function signable(settings) {
+    return settings.signatures !== undefined && !settings.signatures.startsWith('https://');
+}
+/**
+ * isSignPhrase compares a comment with the sign phrase: case, runs of
+ * whitespace and trailing `.` or `!` do not matter; anything else does, so a
+ * comment that quotes the phrase among other text does not sign.
+ *
+ * @param body - the comment body
+ * @param phrase - the phrase, claSignPhrase by default
+ */
+function isSignPhrase(body, phrase = claSignPhrase) {
+    const normalize = (text) => text.trim().replace(/\s+/g, ' ').replace(/[.!]+$/, '').toLowerCase();
+    return normalize(body) !== '' && normalize(body) === normalize(phrase);
+}
+/** how often a write that lost the race to another signer is retried */
+const signatureWriteAttempts = 3;
+/**
+ * addSignature appends an entry to a signatures document: the
+ * `signedContributors` list of a mapping (other keys are kept), or a
+ * top-level list. A document that already has the id is returned unchanged.
+ *
+ * @param source - where the text came from, for the error messages
+ * @param text - the current file, JSON
+ * @param entry - the signature to add
+ * @returns the new file text, or undefined when the id has signed already
+ */
+function addSignature(source, text, entry) {
+    let document;
+    try {
+        document = JSON.parse(text);
+    }
+    catch (e) {
+        throw new Error(`${source}: signing needs a JSON signatures file: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    const list = Array.isArray(document)
+        ? document
+        : isMapping(document) && Array.isArray(document.signedContributors) ? document.signedContributors : undefined;
+    if (list === undefined) {
+        throw new Error(`${source}: expected a list of signers, or a mapping with a signedContributors list`);
+    }
+    if (list.some(signer => isMapping(signer) && signer.id === entry.id)) {
+        return undefined;
+    }
+    list.push({ ...entry });
+    return `${JSON.stringify(document, null, 2)}${text.endsWith('\n') ? '\n' : ''}`;
+}
+/**
+ * recordSignature adds a signature to the signatures file of a repository
+ * with one commit. When someone else's signature lands between the read and
+ * the write, GitHub refuses the stale write (409) and it starts over, at most
+ * signatureWriteAttempts times. The signatures cached for the run are
+ * replaced with the new ones.
+ *
+ * @param octokit - a github client that may write the signatures repository
+ * @param source - the `cla.signatures` source, `owner/repo:path[@branch]`
+ * @param entry - the signature to add
+ * @param message - the commit message
+ */
+async function recordSignature(octokit, source, entry, message) {
+    const parsed = parseExplicitSource(source, 'cla signatures');
+    if (parsed.kind !== 'repo') {
+        throw new Error(`cla signatures at ${source} are read-only: signing needs owner/repo:path[@branch]`);
+    }
+    const { owner, repo, path, ref } = parsed.file;
+    for (let attempt = 1;; attempt++) {
+        // unknown first: the response type is a union (file, symlink, directory listing) that isMapping cannot narrow
+        const data = (await octokit.repos.getContent({ owner, repo, path, ...(ref === undefined ? {} : { ref }) })).data;
+        if (!isMapping(data) || typeof data.content !== 'string' || typeof data.encoding !== 'string' || typeof data.sha !== 'string') {
+            throw new TypeError(`cla signatures: ${path} is not a file`);
+        }
+        const current = decodeContent(data.content, data.encoding);
+        const next = addSignature(source, current, entry);
+        try {
+            if (next !== undefined) {
+                await octokit.repos.createOrUpdateFileContents({
+                    owner,
+                    repo,
+                    path,
+                    message,
+                    content: encodeContent(next),
+                    sha: data.sha,
+                    ...(ref === undefined ? {} : { branch: ref }),
+                });
+            }
+            const cache = platform_platform().state().claSignatures;
+            cache.set(source, Promise.resolve(parseSignatures(source, next ?? current)));
+            return;
+        }
+        catch (e) {
+            if (e.status !== 409 || attempt >= signatureWriteAttempts) {
+                throw new Error(`could not record the signature in ${source}: ${e}`);
+            }
+            platform_platform().log.info(`cla: ${source} changed while signing, attempt ${attempt + 1}`);
+        }
+    }
+}
+/**
+ * signFromComment is how a contributor signs: a new comment on an open pull
+ * request that is exactly the sign phrase, written by one of the pull
+ * request's commit authors, records their signature (login, id, the comment
+ * and the pull request) in the signatures file, then re-checks the pull
+ * request. Every other comment is `ignored` before any API call; a
+ * configuration that cannot be loaded is logged and the comment ignored too,
+ * so a conversation comment never fails the run on its account.
+ *
+ * @param context - the github context of the current action event
+ */
+async function signFromComment(context = platform_platform().context()) {
+    const issue = context.payload.issue;
+    const comment = context.payload.comment;
+    const body = comment?.body ?? '';
+    if (issue?.pull_request === undefined || issue.state !== 'open' || comment === undefined || comment.user?.type === 'Bot' || !isSignPhrase(body) || !claEnabled()) {
+        return 'ignored';
+    }
+    const octokit = newOctokitFromInputs();
+    let settings;
+    try {
+        settings = resolveCla((await loadProwConfig(octokit, context)).cla);
+    }
+    catch (e) {
+        platform_platform().log.warning(`cla: not checking the comment for a signature, the configuration could not be loaded: ${e}`);
+        return 'ignored';
+    }
+    if (settings.signatures === undefined) {
+        return 'ignored';
+    }
+    const signer = comment.user;
+    if (!signable(settings)) {
+        await createComment(octokit, context, issue.number, `@${signer.login} signatures cannot be recorded here: \`cla.signatures\` is an https:// url. Ask the maintainers how to sign.`);
+        return 'refused';
+    }
+    const commits = await octokit.paginate(octokit.pulls.listCommits, { ...context.repo, pull_number: issue.number, per_page: 100 });
+    if (!commits.some(commit => commit.author?.id === signer.id)) {
+        await createComment(octokit, context, issue.number, `@${signer.login} only the authors of this pull request's commits sign the CLA here; your comment was not recorded as a signature.`);
+        return 'refused';
+    }
+    const signatures = await loadSignatures(octokit, settings.signatures);
+    if (!signatures.ids.has(signer.id)) {
+        const repository = context.payload.repository;
+        if (repository === undefined) {
+            throw new Error('cla: the comment event names no repository');
+        }
+        await recordSignature(octokit, settings.signatures, {
+            name: signer.login,
+            id: signer.id,
+            comment_id: comment.id,
+            created_at: comment.created_at,
+            repoId: repository.id,
+            pullRequestNo: issue.number,
+        }, `@${signer.login} has signed the CLA in ${repository.full_name}#${issue.number}`);
+        platform_platform().log.info(`cla: recorded the signature of ${signer.login} from #${issue.number}`);
+    }
+    const { data: pull } = await octokit.pulls.get({ ...context.repo, pull_number: issue.number });
+    await enforceCla(octokit, context, { number: issue.number, sha: pull.head.sha });
+    return 'signed';
+}
+/**
+ * claOnPullRequest is the `pull_request` / `pull_request_target` handler:
+ * on `opened`, `reopened` and `synchronize` it checks the pull request's
+ * commit authors against the signatures.
+ *
+ * @param context - the github context of the current action event
+ */
+async function claOnPullRequest(context = platform_platform().context()) {
+    const action = context.payload.action;
+    const pull = context.payload.pull_request;
+    if (action === undefined || !triggerActions.has(action) || pull === undefined) {
+        platform_platform().log.debug(`cla: skipping ${action} action`);
+        return;
+    }
+    if (!claEnabled()) {
+        platform_platform().log.debug('cla: /check-cla is not in prow-commands');
+        return;
+    }
+    await enforceCla(newOctokitFromInputs(), context, { number: pull.number, sha: pull.head.sha });
+}
+/**
+ * checkCla is the `/check-cla` comment command: it re-checks an open pull
+ * request, for instance after its authors signed.
+ *
+ * @param context - the github context of the current action event
+ */
+async function checkCla(context = platform_platform().context()) {
+    const issue = context.payload.issue;
+    if (issue?.pull_request === undefined || issue.state !== 'open') {
+        platform_platform().log.debug('cla: /check-cla applies to open pull requests only');
+        return;
+    }
+    const octokit = newOctokitFromInputs();
+    const { data: pull } = await octokit.pulls.get({ ...context.repo, pull_number: issue.number });
+    const verdict = await enforceCla(octokit, context, { number: issue.number, sha: pull.head.sha });
+    if (verdict === undefined) {
+        await createComment(octokit, context, issue.number, '`/check-cla`: no CLA check is configured for this repository (`cla.signatures` in the prow configuration).');
+    }
+}
+
 ;// CONCATENATED MODULE: ./lib/plugins/ownersLabel.js
 
 
 
 
-const triggerActions = new Set(['opened', 'reopened', 'synchronize']);
+const ownersLabel_triggerActions = new Set(['opened', 'reopened', 'synchronize']);
 /**
  * ownersLabel is the `pull_request` handler modelled on Prow's owners-label
  * plugin: on `opened`, `reopened` and `synchronize` it adds the `labels:`
@@ -45543,7 +46105,7 @@ const triggerActions = new Set(['opened', 'reopened', 'synchronize']);
  */
 async function ownersLabel(context = platform_platform().context()) {
     const action = context.payload.action;
-    if (action === undefined || !triggerActions.has(action)) {
+    if (action === undefined || !ownersLabel_triggerActions.has(action)) {
         platform_platform().log.debug(`owners-label: skipping ${action} action`);
         return;
     }
@@ -45827,6 +46389,7 @@ function requireMatchingLabel_sameLabel(a, b) {
 
 
 
+
 /** pull requests evaluated at once; keeps a busy repository within the api's secondary rate limits */
 const sweepConcurrency = 3;
 const pageSize = 100;
@@ -45834,7 +46397,8 @@ const pageSize = 100;
  * sweep is the scheduled job of the `pull_request` install mode: for every
  * open pull request updated within `sweep.lookback` it does what the
  * `pull_request` and `pull_request_review` handlers would have done with a
- * write token, in their order: the `require_matching_label` rules, the OWNERS
+ * write token, in their order: the `require_matching_label` rules, the CLA
+ * check, the OWNERS
  * labels, blunderbuss on a fresh pull request nobody reviews yet, the
  * approval, the pending runs of a pull request labeled `ok-to-test`, then the merge path (lgtm binding, mergeability, merge). Each
  * pull request is evaluated sequentially, a few pull requests at a time; a
@@ -45918,6 +46482,9 @@ async function sweepPullRequest(octokit, context, pr, plugins) {
     ];
     const steps = [
         ['require-matching-label', () => enforceRequiredLabels(octokit, context, { issueNumber: pr.number, isPullRequest: true })],
+        ['cla', async () => {
+                await enforceCla(octokit, context, { number: pr.number, sha: pr.head.sha });
+            }],
         ...(hasOwners ? ownersSteps : []),
         ['ok-to-test', () => approveIfTrusted(octokit, context, pr)],
         ['tide', async () => {
@@ -47285,6 +47852,7 @@ async function removeSelfReviewReq(octokit, context, pullNum, user) {
 
 
 
+
 // hand-written commands; looked up lazily so the module bindings stay spy-able
 const handlers = {
     '/assign': context => assign_assign(context),
@@ -47303,6 +47871,7 @@ const handlers = {
     '/meow': context => meow(context),
     '/label-sync': context => labelSyncCommand(context),
     '/check-required-labels': context => checkRequiredLabels(context),
+    '/check-cla': context => checkCla(context),
     '/auto-cc': context => autoCc(context),
     '/retest': context => retest(context),
     '/test': context => test(context),
@@ -47324,7 +47893,7 @@ function isDynamicLabelCommand(command) {
         && !(command in commandAliases);
 }
 // only a command that may have written a label needs the post-command sweep; the rest stay free of extra calls
-const labelWritingHandlers = new Set(['/lgtm', '/approve', '/hold', '/remove', '/ok-to-test']);
+const labelWritingHandlers = new Set(['/lgtm', '/approve', '/hold', '/remove', '/ok-to-test', '/check-cla']);
 function changesLabels(command) {
     return labelWritingHandlers.has(command)
         || prefixedLabelCommands.some(cmd => cmd.command === command)
@@ -47360,6 +47929,19 @@ async function handleIssueComment(context = platform_platform().context()) {
     const action = context.payload.action;
     if (action !== undefined && action !== 'created') {
         platform_platform().log.info(`issue_comment: ignoring the ${action} action; commands run only on created comments`);
+        return;
+    }
+    // a comment that is the CLA sign phrase signs, and carries no command
+    const signing = await signFromComment(context).catch(normalizeError);
+    if (signing instanceof Error) {
+        platform_platform().fail(`error handling issue comment: ${signing}`);
+        return;
+    }
+    if (signing !== 'ignored') {
+        if (signing === 'signed') {
+            // the bot's own label write fires no `labeled` event: run the merge gate it would have
+            await tideOnComment(context).catch(e => platform_platform().fail(`error handling issue comment: ${normalizeError(e)}`));
+        }
         return;
     }
     const commandConfig = [...new Set(platform_platform().inputs.get('prow-commands', { required: false }).split(/\s+/).filter(command => command !== '').map(command => canonicalCommand(command.toLowerCase())))];
@@ -47568,8 +48150,9 @@ async function onPrLgtm(context) {
 
 
 
-/** handlers that run on every `pull_request` / `pull_request_target` event, in this order, next to the `jobs` input; lgtm binds a hand-applied label and approve applies its label before tide reads them; ok-to-test approves the pending runs of a trusted pull request */
-const pullRequestHandlers = [requireMatchingLabel, ownersLabel, blunderbuss, lgtmOnPullRequest, approveOnPullRequest, okToTestOnPullRequest, tideOnPullRequest];
+
+/** handlers that run on every `pull_request` / `pull_request_target` event, in this order, next to the `jobs` input; lgtm binds a hand-applied label and approve applies its label before tide reads them; ok-to-test approves the pending runs of a trusted pull request; cla sets its label before tide reads it */
+const pullRequestHandlers = [requireMatchingLabel, claOnPullRequest, ownersLabel, blunderbuss, lgtmOnPullRequest, approveOnPullRequest, okToTestOnPullRequest, tideOnPullRequest];
 /**
  * This method handles any pull-request configuration for configured workflows:
  * the registered handlers and the `jobs` input. The `lgtm` job only acts on

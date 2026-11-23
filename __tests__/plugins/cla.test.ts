@@ -6,7 +6,7 @@ import { setupServer } from 'msw/node'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { handleIssueComment } from '../../src/issueComment/handleIssueComment'
-import { checkCla, claLabels, claOnPullRequest, claStatusContext, coveredByDomain, enforceCla, evaluateCommits, loadSignatures, maxListedCommits, parseSignatures } from '../../src/plugins/cla'
+import { checkCla, claEnabled, claLabels, claOnPullRequest, claStatusContext, coveredByDomain, enforceCla, evaluateCommits, loadSignatures, maxListedCommits, parseSignatures } from '../../src/plugins/cla'
 import { mergeProwConfig, parseProwConfig, readSource, resolveCla } from '../../src/utils/config'
 import { desiredLabels } from '../../src/utils/labelCatalog'
 import { newOctokit } from '../../src/utils/octokit'
@@ -254,7 +254,7 @@ interface Serve {
 
 function serve(options: Serve = {}): Writes {
   const writes: Writes = { added: [], removed: [], statuses: [], comments: [], signatureReads: 0 }
-  const config = options.config ?? `cla:\n  signatures: ${signaturesSource}\n  document: https://example.com/cla\n  instructions: Questions? Ask in #cla.\n`
+  const config = options.config ?? `cla:\n  signatures: ${signaturesSource}\n  document: https://example.com/cla\n  instructions: \'Questions? Ask in #cla.\'\n`
   server.use(
     http.get(utils.contentsUrl('.github/prow.yaml'), utils.mockResponse(200, file(config))),
     ...utils.noOrgOrRepoConfigExcept('.github/prow.yaml'),
@@ -373,8 +373,24 @@ describe('enforceCla', () => {
   })
 })
 
+describe('claEnabled', () => {
+  it('is on only while /check-cla is in prow-commands, compared case-insensitively', () => {
+    utils.setupActionsEnv('/lgtm /approve')
+    expect(claEnabled()).toBe(false)
+    utils.setupActionsEnv('/lgtm  /Check-CLA')
+    expect(claEnabled()).toBe(true)
+    utils.setupActionsEnv('')
+    expect(claEnabled()).toBe(false)
+  })
+})
+
 describe('claOnPullRequest', () => {
-  beforeEach(() => utils.setupActionsEnv())
+  beforeEach(() => utils.setupActionsEnv('/check-cla'))
+
+  it('reads nothing while /check-cla is not in prow-commands', async () => {
+    utils.setupActionsEnv('/lgtm')
+    await expect(claOnPullRequest(new utils.MockContext(pullReqOpenedEvent))).resolves.toBeUndefined()
+  })
 
   it('checks the head commit on opened, reopened and synchronize', async () => {
     const writes = serve({ commits: signedCommits })

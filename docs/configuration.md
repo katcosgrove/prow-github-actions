@@ -469,6 +469,10 @@ the bot adds them to a signatures file in a repository of your choosing. No Easy
 Assistant or other service is involved; the file keeps CLA Assistant's `signedContributors`
 format, so an existing one carries over as it is.
 
+Switch it on by adding `/check-cla` to the `prow-commands` input (`PROW_COMMANDS` for the
+[GitHub App](./github-app.md)). Like `/meow` it is not in the default list, so a repository that
+does not use it reads no configuration on its pushes and conversation comments.
+
 ```yaml
 cla:
   signatures: your-org/cla:cla/signatures.json@main
