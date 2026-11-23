@@ -16,6 +16,7 @@ import {
   parseProwConfig,
   repoConfigPaths,
   resolveAuthorization,
+  resolveCla,
   resolveHoldLabel,
   resolveSweepLookback,
   resolveTide,
@@ -79,6 +80,7 @@ const resolvedDefaults: Record<string, Record<string, unknown>> = {
   lgtm: { ...lgtmSettings(empty) },
   sweep: { lookback: defaultSweepLookback },
   authorization: { ...resolveAuthorization({}) },
+  cla: { ...resolveCla({}) },
 }
 
 describe(`${docPath} prow.yaml example`, () => {
@@ -88,7 +90,7 @@ describe(`${docPath} prow.yaml example`, () => {
     expect(example.require_matching_label).toHaveLength(2)
   })
 
-  it.each(['tide', 'hold', 'approve', 'lgtm', 'sweep', 'authorization'])('spells out the code defaults of %s, as its comment claims', (key) => {
+  it.each(['tide', 'hold', 'approve', 'lgtm', 'sweep', 'authorization', 'cla'])('spells out the code defaults of %s, as its comment claims', (key) => {
     expect(example[key as keyof ProwConfig]).toEqual(resolvedDefaults[key])
   })
 

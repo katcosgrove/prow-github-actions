@@ -129,6 +129,42 @@ export interface ResolvedAuthorization {
   users: string[]
 }
 
+/**
+ * the `cla` section: every commit author of a pull request must appear in a
+ * signatures file, which the check reflects in a `<label_prefix>: yes` /
+ * `<label_prefix>: no` label and a `prow/cla` commit status
+ */
+export interface ClaConfig {
+  /** where the signatures live: `owner/repo:path[@ref]` (read with github-token) or an `https://` url; unset disables the check */
+  signatures?: string
+  /** the labels are `<label_prefix>: yes` and `<label_prefix>: no`; default `cla` */
+  label_prefix?: string
+  /** commit authors never checked, compared case-insensitively */
+  ignore?: string[]
+  /**
+   * email domains covered by a corporate CLA: a commit passes when GitHub links it to an
+   * account and its author email is at one of them; `*.example.com` covers the subdomains
+   */
+  domains?: string[]
+  /** commits authored by a GitHub App (`type: Bot`) need no signature; default true */
+  allow_bots?: boolean
+  /** the CLA text the signers agree to, an https:// url linked from the bot's comment */
+  document?: string
+  /** appended to the comment that lists the missing signatures */
+  instructions?: string
+}
+
+/** ClaConfig with every default applied and `ignore` lower-cased, see resolveCla */
+export interface ResolvedCla {
+  signatures?: string
+  label_prefix: string
+  ignore: string[]
+  domains: string[]
+  allow_bots: boolean
+  document?: string
+  instructions?: string
+}
+
 export interface ProwConfig {
   labels: Record<string, LabelSection>
   require_matching_label: RequireMatchingLabel[]
@@ -139,6 +175,7 @@ export interface ProwConfig {
   lgtm: LgtmConfig
   sweep: SweepConfig
   authorization: AuthorizationConfig
+  cla: ClaConfig
   /** every file that contributed, lowest precedence first, as `owner/repo:path` or a url */
   sources: string[]
 }
@@ -155,7 +192,13 @@ export const defaultOwnersTideLabels = ['lgtm', 'approved']
 export const defaultTideMissingLabels = ['do-not-merge/*', 'needs-rebase', 'hold']
 
 // top level keys of the new form other than `labels`
-const reservedKeys = ['require_matching_label', 'tide', 'hold', 'blunderbuss', 'approve', 'lgtm', 'sweep', 'authorization'] as const
+const reservedKeys = ['require_matching_label', 'tide', 'hold', 'blunderbuss', 'approve', 'lgtm', 'sweep', 'authorization', 'cla'] as const
+const claKeys = ['signatures', 'label_prefix', 'ignore', 'domains', 'allow_bots', 'document', 'instructions'] as const
+/** a contributor signs by commenting exactly this, the phrase CLA Assistant asks for */
+export const claSignPhrase = 'I have read the CLA Document and I hereby sign the CLA'
+// a DNS name of two or more labels, each 1-63 letters, digits or inner hyphens
+const domainPattern = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$/
+export const defaultClaLabelPrefix = 'cla'
 
 const authorizationPolicies = ['anyone', 'collaborators', 'members', 'trusted'] as const
 const reviewAuthorizationPolicies = ['members', 'trusted'] as const
@@ -290,13 +333,13 @@ async function firstFound(probes: Probe[], octokit: Octokit): Promise<Tier | und
   return undefined
 }
 
-type ExplicitSource
+export type ExplicitSource
   = | { kind: 'url', input: string }
     | { kind: 'repo', input: string, file: { owner: string, repo: string, path: string, ref?: string } }
 
-function parseExplicitSource(input: string): ExplicitSource {
+export function parseExplicitSource(input: string, name = 'config'): ExplicitSource {
   if (input.startsWith('http://')) {
-    throw new Error('config: http:// sources are not allowed, use https://')
+    throw new Error(`${name}: http:// sources are not allowed, use https://`)
   }
 
   if (input.startsWith('https://')) {
@@ -305,7 +348,7 @@ function parseExplicitSource(input: string): ExplicitSource {
 
   const match = explicitSourcePattern.exec(input)
   if (match === null) {
-    throw new Error(`config: expected owner/repo:path[@ref] or an https:// url, got '${input}'`)
+    throw new Error(`${name}: expected owner/repo:path[@ref] or an https:// url, got '${input}'`)
   }
 
   const [, owner, repo, path, ref] = match
@@ -332,6 +375,34 @@ async function loadExplicitTier(octokit: Octokit, source: ExplicitSource): Promi
   return { source: input, config: parseProwConfig(input, text) }
 }
 
+/**
+ * readSource reads a file named the way the `config` input names one:
+ * `owner/repo:path[@ref]`, read with the given client, or an `https://` url,
+ * fetched anonymously. A missing file is an error.
+ *
+ * @param octokit - a hydrated github client
+ * @param input - the source, ex: `my-org/cla:signatures.json@main`
+ * @param what - what the file is, for the error messages, ex: `cla signatures`
+ */
+export async function readSource(octokit: Octokit, input: string, what: string): Promise<string> {
+  const source = parseExplicitSource(input, what)
+  if (source.kind === 'url') {
+    return fetchUrl(input, what)
+  }
+
+  let text: string | undefined
+  try {
+    text = await fetchRepoFile(octokit, source.file)
+  }
+  catch (e) {
+    throw new Error(`could not load ${what} from ${input}: ${e}`)
+  }
+  if (text === undefined) {
+    throw new Error(`could not load ${what} from ${input}: not found`)
+  }
+  return text
+}
+
 // resolves to undefined when the repository or the file does not exist
 async function fetchRepoFile(
   octokit: Octokit,
@@ -355,17 +426,17 @@ async function fetchRepoFile(
   return decodeContent(data.content, data.encoding)
 }
 
-async function fetchUrl(url: string): Promise<string> {
+async function fetchUrl(url: string, what = 'prow config'): Promise<string> {
   let response: Response
   try {
     response = await fetch(url, { signal: AbortSignal.timeout(5000) })
   }
   catch (e) {
-    throw new Error(`could not load prow config from ${url}: ${e}`)
+    throw new Error(`could not load ${what} from ${url}: ${e}`)
   }
 
   if (!response.ok) {
-    throw new Error(`could not load prow config from ${url}: HTTP ${response.status}`)
+    throw new Error(`could not load ${what} from ${url}: HTTP ${response.status}`)
   }
 
   return response.text()
@@ -441,6 +512,9 @@ export function parseProwConfig(source: string, text: string): Partial<ProwConfi
   }
   if (loaded.authorization !== undefined) {
     config.authorization = normalizeAuthorization(source, loaded.authorization)
+  }
+  if (loaded.cla !== undefined) {
+    config.cla = normalizeCla(source, loaded.cla)
   }
 
   const unknown = Object.keys(loaded).filter(key => key !== 'labels' && !(reservedKeys as readonly string[]).includes(key))
@@ -743,10 +817,75 @@ function normalizeAuthorization(source: string, raw: unknown): AuthorizationConf
   })
 }
 
+function normalizeCla(source: string, raw: unknown): ClaConfig {
+  if (!isMapping(raw)) {
+    throw new Error(`${source}: cla must be a mapping`)
+  }
+
+  const unknown = Object.keys(raw).find(key => !(claKeys as readonly string[]).includes(key))
+  if (unknown !== undefined) {
+    throw new Error(`${source}: cla.${unknown} is not a known key, expected one of ${claKeys.join(', ')}`)
+  }
+
+  if (raw.signatures !== undefined) {
+    if (typeof raw.signatures !== 'string' || raw.signatures.trim() === '') {
+      throw new Error(`${source}: cla.signatures must be owner/repo:path[@ref] or an https:// url`)
+    }
+    // refuse a malformed source when the configuration loads, not on the first pull request
+    parseExplicitSource(raw.signatures.trim(), `${source}: cla.signatures`)
+  }
+
+  if (raw.label_prefix !== undefined && (typeof raw.label_prefix !== 'string' || raw.label_prefix.trim() === '')) {
+    throw new Error(`${source}: cla.label_prefix must be a non-empty string`)
+  }
+
+  const ignore = raw.ignore === undefined ? undefined : normalizeLogins(raw.ignore)
+  if (ignore === null) {
+    throw new Error(`${source}: cla.ignore must be a list of logins`)
+  }
+
+  const domains = raw.domains === undefined ? undefined : normalizeDomains(raw.domains)
+  if (domains === null) {
+    throw new Error(`${source}: cla.domains must be a list of email domains, ex: example.com or *.example.com`)
+  }
+
+  if (raw.allow_bots !== undefined && typeof raw.allow_bots !== 'boolean') {
+    throw new Error(`${source}: cla.allow_bots must be a boolean`)
+  }
+
+  if (raw.document !== undefined && (typeof raw.document !== 'string' || !/^https:\/\/\S+$/.test(raw.document.trim()))) {
+    throw new Error(`${source}: cla.document must be an https:// url`)
+  }
+
+  if (raw.instructions !== undefined && typeof raw.instructions !== 'string') {
+    throw new Error(`${source}: cla.instructions must be a string`)
+  }
+
+  return stripUndefined({
+    signatures: (raw.signatures as string | undefined)?.trim(),
+    label_prefix: (raw.label_prefix as string | undefined)?.trim(),
+    ignore,
+    domains,
+    allow_bots: raw.allow_bots as boolean | undefined,
+    document: (raw.document as string | undefined)?.trim(),
+    instructions: raw.instructions as string | undefined,
+  })
+}
+
 // a GitHub login, or a GitHub App's `<slug>[bot]`; no leading `@`, no inner spaces
 const loginPattern = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\[bot\])?$/
 
 // the trimmed logins, or null when the value is not a list of valid logins
+// lower-cased, a leading `@` dropped; null when any entry is not a domain or a `*.` wildcard of one
+function normalizeDomains(value: unknown): string[] | null {
+  if (!isStringList(value)) {
+    return null
+  }
+  const domains = value.map(entry => entry.trim().toLowerCase().replace(/^@/, ''))
+  const valid = domains.every(domain => domainPattern.test(domain.startsWith('*.') ? domain.slice(2) : domain))
+  return valid ? [...new Set(domains)] : null
+}
+
 function normalizeLogins(value: unknown): string[] | null {
   if (!isStringList(value)) {
     return null
@@ -768,7 +907,7 @@ export function resolveSweepLookback(sweep: SweepConfig): number {
 /**
  * mergeProwConfig layers `over` on top of `base`: label sections replace per
  * key, require_matching_label rules concatenate, tide, hold, blunderbuss,
- * approve, lgtm, sweep and authorization shallow-merge, except that
+ * approve, lgtm, sweep, authorization and cla shallow-merge, except that
  * `authorization.users` is the union of both tiers.
  *
  * @param base - the lower precedence tier
@@ -785,6 +924,7 @@ export function mergeProwConfig(base: Partial<ProwConfig>, over: Partial<ProwCon
     lgtm: { ...base.lgtm, ...over.lgtm },
     sweep: { ...base.sweep, ...over.sweep },
     authorization: mergeAuthorization(base.authorization, over.authorization),
+    cla: { ...base.cla, ...over.cla },
   }
 }
 
@@ -870,6 +1010,34 @@ export function resolveAuthorization(authorization: AuthorizationConfig): Resolv
     review: authorization.review ?? defaultAuthorization.review,
     users: (authorization.users ?? defaultAuthorization.users).map(login => login.toLowerCase()),
   }
+}
+
+/**
+ * resolveCla applies the defaults to a merged cla section: labels prefixed
+ * `cla`, bots allowed, nobody ignored. The check is off while `signatures` is
+ * unset.
+ *
+ * @param cla - the merged cla section
+ */
+export function resolveCla(cla: ClaConfig): ResolvedCla {
+  return {
+    signatures: cla.signatures,
+    label_prefix: cla.label_prefix ?? defaultClaLabelPrefix,
+    ignore: (cla.ignore ?? []).map(login => login.toLowerCase()),
+    domains: cla.domains ?? [],
+    allow_bots: cla.allow_bots ?? true,
+    document: cla.document,
+    instructions: cla.instructions,
+  }
+}
+
+/**
+ * claLabels names the two labels the CLA check manages.
+ *
+ * @param settings - the resolved cla section
+ */
+export function claLabels(settings: Pick<ResolvedCla, 'label_prefix'>): { yes: string, no: string } {
+  return { yes: `${settings.label_prefix}: yes`, no: `${settings.label_prefix}: no` }
 }
 
 export function isMapping(value: unknown): value is Record<string, unknown> {

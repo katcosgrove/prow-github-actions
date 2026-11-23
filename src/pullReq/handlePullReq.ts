@@ -5,6 +5,7 @@ import { okToTestOnPullRequest } from '../issueComment/trigger'
 import { platform } from '../platform'
 import { approveOnPullRequest } from '../plugins/approve'
 import { blunderbuss } from '../plugins/blunderbuss'
+import { claOnPullRequest } from '../plugins/cla'
 import { lgtmOnPullRequest } from '../plugins/lgtmBinding'
 import { ownersLabel } from '../plugins/ownersLabel'
 import { requireMatchingLabel } from '../plugins/requireMatchingLabel'
@@ -12,8 +13,8 @@ import { tideOnPullRequest } from '../plugins/tide'
 import { runEventHandlers, skipReadOnlyForkRun } from '../utils/events'
 import { onPrLgtm } from './onPrLgtm'
 
-/** handlers that run on every `pull_request` / `pull_request_target` event, in this order, next to the `jobs` input; lgtm binds a hand-applied label and approve applies its label before tide reads them; ok-to-test approves the pending runs of a trusted pull request */
-export const pullRequestHandlers: EventHandler[] = [requireMatchingLabel, ownersLabel, blunderbuss, lgtmOnPullRequest, approveOnPullRequest, okToTestOnPullRequest, tideOnPullRequest]
+/** handlers that run on every `pull_request` / `pull_request_target` event, in this order, next to the `jobs` input; lgtm binds a hand-applied label and approve applies its label before tide reads them; ok-to-test approves the pending runs of a trusted pull request; cla sets its label before tide reads it */
+export const pullRequestHandlers: EventHandler[] = [requireMatchingLabel, claOnPullRequest, ownersLabel, blunderbuss, lgtmOnPullRequest, approveOnPullRequest, okToTestOnPullRequest, tideOnPullRequest]
 
 /**
  * This method handles any pull-request configuration for configured workflows:

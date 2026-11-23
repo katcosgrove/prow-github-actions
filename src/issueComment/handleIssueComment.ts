@@ -9,6 +9,7 @@ import { addPrefixedLabels, dynamicPrefixedCommand, labelCommandName, prefixedLa
 import { remove } from '../labels/remove'
 import { platform } from '../platform'
 import { autoCc } from '../plugins/blunderbuss'
+import { checkCla, signFromComment } from '../plugins/cla'
 import { checkRequiredLabels } from '../plugins/requireMatchingLabel'
 import { tideOnComment } from '../plugins/tide'
 import { hasCommand } from '../utils/command'
@@ -44,6 +45,7 @@ const handlers: Record<string, (context: Context) => Promise<void>> = {
   '/meow': context => meow(context),
   '/label-sync': context => labelSyncCommand(context),
   '/check-required-labels': context => checkRequiredLabels(context),
+  '/check-cla': context => checkCla(context),
   '/auto-cc': context => autoCc(context),
   '/retest': context => retest(context),
   '/test': context => test(context),
@@ -70,7 +72,7 @@ function isDynamicLabelCommand(command: string): boolean {
 }
 
 // only a command that may have written a label needs the post-command sweep; the rest stay free of extra calls
-const labelWritingHandlers = new Set(['/lgtm', '/approve', '/hold', '/remove', '/ok-to-test'])
+const labelWritingHandlers = new Set(['/lgtm', '/approve', '/hold', '/remove', '/ok-to-test', '/check-cla'])
 
 function changesLabels(command: string): boolean {
   return labelWritingHandlers.has(command)
@@ -111,6 +113,20 @@ export async function handleIssueComment(context: Context = platform().context()
   const action: string | undefined = context.payload.action
   if (action !== undefined && action !== 'created') {
     platform().log.info(`issue_comment: ignoring the ${action} action; commands run only on created comments`)
+    return
+  }
+
+  // a comment that is the CLA sign phrase signs, and carries no command
+  const signing = await signFromComment(context).catch(normalizeError)
+  if (signing instanceof Error) {
+    platform().fail(`error handling issue comment: ${signing}`)
+    return
+  }
+  if (signing !== 'ignored') {
+    if (signing === 'signed') {
+      // the bot's own label write fires no `labeled` event: run the merge gate it would have
+      await tideOnComment(context).catch(e => platform().fail(`error handling issue comment: ${normalizeError(e)}`))
+    }
     return
   }
 

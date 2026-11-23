@@ -129,6 +129,13 @@ authorization:
   close: collaborators
   review: members
   users: []
+
+# the CLA check is off until signatures is set; these are the other defaults
+cla:
+  label_prefix: cla
+  ignore: []
+  domains: []
+  allow_bots: true
 ```
 
 ### `labels`
@@ -454,6 +461,105 @@ When `labels` is not `anyone`, a [`require_matching_label`](#require_matching_la
 `missing_comment` should not tell authors to run label commands such as `/kind` they may no longer
 run.
 
+### `cla`
+
+Has every commit author of a pull request sign a Contributor License Agreement, and records
+the signatures itself: a contributor signs by commenting a fixed phrase on the pull request, and
+the bot adds them to a signatures file in a repository of your choosing. No EasyCLA, CLA
+Assistant or other service is involved; the file keeps CLA Assistant's `signedContributors`
+format, so an existing one carries over as it is.
+
+```yaml
+cla:
+  signatures: your-org/cla:cla/signatures.json@main
+  document: https://github.com/your-org/cla/blob/main/CLA.md
+  ignore: [dependabot]
+  domains: [percona.com]
+tide:
+  labels: [lgtm, approved, 'cla: yes']
+```
+
+Field | Default | Meaning
+--- | --- | ---
+`signatures` | unset | where the signatures live: `owner/repo:path[@branch]`, read and written with `github-token`, or an `https://` URL, fetched anonymously and read-only (nobody can sign); unset turns the check off
+`document` | unset | the CLA text, an `https://` URL the bot's comment links to
+`label_prefix` | `cla` | the check applies `<label_prefix>: yes` or `<label_prefix>: no` and removes the other
+`ignore` | `[]` | commit authors that need no signature, compared case-insensitively
+`domains` | `[]` | email domains covered by a corporate CLA: a commit passes when its author email is at one of them, compared case-insensitively. `example.com` covers `a@example.com` only; `*.example.com` covers `a@eng.example.com` but not `a@example.com`. A leading `@` is dropped
+`allow_bots` | `true` | commits authored by a GitHub App (`dependabot[bot]`, `github-actions[bot]`) need no signature
+`instructions` | unset | appended to the comment that names the missing signatures, ex: whom to ask about a corporate CLA
+
+#### Checking
+
+The check runs on `opened`, `reopened` and `synchronize`, after a signature, on
+[`/check-cla`](./commands.md) and in the [`sweep` job](./cron-jobs.md#sweep). For each commit of
+the pull request it reads the GitHub account the API links the author to:
+
+- a signed author, an `ignore`d one, one whose author email is at one of `domains` or, while
+  `allow_bots` holds, a GitHub App passes;
+- an author with no signature fails, and is @-mentioned in the comment;
+- a commit whose author email is linked to no GitHub account fails: there is nobody to look up;
+- a pull request with 250 or more commits fails, since the API lists no more than 250.
+
+The verdict becomes the label and a `prow/cla` commit status on the head commit (`success` or
+`failure`). Gate merges with either: add `<label_prefix>: yes` to [`tide.labels`](#tide)
+(which replaces the default list, so name `lgtm` and `approved` too), or require the `prow/cla`
+status in branch protection. On failure the bot comments once per set of missing authors (a
+push that changes nothing about who is missing posts nothing new), links `document` and quotes
+the sign phrase.
+
+#### Signing
+
+A contributor signs by commenting, on the pull request, exactly:
+
+```text
+I have read the CLA Document and I hereby sign the CLA
+```
+
+the phrase CLA Assistant asks for. Case, line breaks and a final `.` do not matter; any other
+text in the comment does, so a comment that quotes the phrase in a question does not sign. Only
+a new comment on an open pull request counts, edits do not, and only from someone GitHub lists
+as the author of one of its commits; anyone else gets a reply saying the comment was not
+recorded. A comment that is not the phrase costs no API call.
+
+The bot then commits `@<login> has signed the CLA in <owner>/<repo>#<n>` to the signatures file
+on the `@branch` (the default branch without one), appending
+
+```json
+{ "name": "octocat", "id": 583231, "comment_id": 1234567890, "created_at": "2026-11-23T19:00:00Z", "repoId": 186853002, "pullRequestNo": 42 }
+```
+
+to `signedContributors` (or to the top-level list), keeping every other entry and key as it is,
+and re-checks the pull request and the merge gate. Someone who has signed already is not
+added twice. When two people sign at once, the write that loses the race is refused by GitHub
+and retried, up to three times. Signing needs a JSON file; YAML files are read-only.
+
+The signatures file can also hold people the bot never asked: an entry is a login, or a mapping
+with a numeric `id` and/or a `login` (or `name`), such as the `"body": "Corp CLA: ..."` entries
+added by hand. An entry with an `id` matches the GitHub account with that id only, so a renamed
+account still matches and someone who later takes over the old login does not; an entry without
+one matches by login.
+
+> [!WARNING]
+> `domains` trusts the email written into the commit, which its author chooses. The check only
+> accepts it on a commit GitHub has linked to an account, that is, once the address was added
+> to that account, but GitHub does not reliably require that address to be verified (and
+> Enterprise Managed Users' addresses start out unverified), and an employee who leaves keeps
+> the address on their account until they remove it. Use `domains` where a corporate CLA says
+> its employees are covered and that level of assurance is acceptable; list people by `id` in
+> the signatures file otherwise.
+
+#### Permissions
+
+`github-token` needs `pull-requests: write` (labels, comments) and `statuses: write` here, and
+`contents: write` on the repository that holds the signatures. The workflow's `GITHUB_TOKEN`
+reaches no other repository, so a signatures file elsewhere needs a GitHub App installation
+token covering both repositories (or the GitHub App mode, installed on both), or a fine-grained
+token granted both. Since the file is the record of who agreed, protect it: limit who can push
+to that branch other than the token, and keep the signing comments, which the entries point to
+by `comment_id`, from being deleted. The [`label-sync` job](./cron-jobs.md#label-sync) creates
+both labels.
+
 ### `owners-label`
 
 No configuration. Whenever a pull request is `opened`, `reopened` or `synchronize`d the
@@ -486,8 +592,8 @@ Both forms share one parser. The top level `labels` key decides which form a doc
 `labels` is | Form | The `/label` allowlist is
 --- | --- | ---
 a **list** | legacy: every top level key is a label section | the top level `labels` list
-a **mapping** | new: `require_matching_label`, `tide`, `hold`, `blunderbuss`, `approve`, `lgtm`, `sweep`, `authorization` may sit alongside | `labels.labels`
-absent, and `require_matching_label`, `tide`, `hold`, `blunderbuss`, `approve`, `lgtm`, `sweep` or `authorization` is present | new | `labels.labels`
+a **mapping** | new: `require_matching_label`, `tide`, `hold`, `blunderbuss`, `approve`, `lgtm`, `sweep`, `authorization`, `cla` may sit alongside | `labels.labels`
+absent, and `require_matching_label`, `tide`, `hold`, `blunderbuss`, `approve`, `lgtm`, `sweep`, `authorization` or `cla` is present | new | `labels.labels`
 absent otherwise | legacy | none
 
 ```yaml
@@ -518,7 +624,7 @@ Key | Rule
 --- | ---
 `labels` | per section: a repository section replaces the organization section of the same name; other organization sections survive
 `require_matching_label` | lists concatenate, organization rules first
-`tide`, `hold`, `blunderbuss`, `approve`, `lgtm`, `sweep`, `authorization` | shallow merge; a repository field wins
+`tide`, `hold`, `blunderbuss`, `approve`, `lgtm`, `sweep`, `authorization`, `cla` | shallow merge; a repository field wins
 `authorization.users` | lists union, organization logins first, duplicates dropped case-insensitively
 
 ```yaml

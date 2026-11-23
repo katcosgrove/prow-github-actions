@@ -107,6 +107,8 @@ export interface RunState {
   tideEvaluated: Set<number>
   /** the token's own login, keyed by API root: one token per event */
   tokenLogins: Map<string, Promise<string | undefined>>
+  /** the parsed cla signatures, keyed by source */
+  claSignatures: Map<string, Promise<unknown>>
   warned: Set<'merge-queue-unavailable' | 'merge-method-ignored'>
 }
 
@@ -126,6 +128,7 @@ export function newRunState(): RunState {
     clients: new Map(),
     tideEvaluated: new Set(),
     tokenLogins: new Map(),
+    claSignatures: new Map(),
     warned: new Set(),
   }
 }

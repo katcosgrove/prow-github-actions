@@ -7,6 +7,7 @@ import { approvePendingRuns, okToTestLabel } from '../issueComment/trigger'
 import { platform } from '../platform'
 import { evaluateApproval } from '../plugins/approve'
 import { blunderbussSettings, requestOwnersReviewers } from '../plugins/blunderbuss'
+import { enforceCla } from '../plugins/cla'
 import { lgtmSettings } from '../plugins/lgtmBinding'
 import { applyOwnersLabels } from '../plugins/ownersLabel'
 import { enforceRequiredLabels } from '../plugins/requireMatchingLabel'
@@ -39,7 +40,8 @@ const pageSize = 100
  * sweep is the scheduled job of the `pull_request` install mode: for every
  * open pull request updated within `sweep.lookback` it does what the
  * `pull_request` and `pull_request_review` handlers would have done with a
- * write token, in their order: the `require_matching_label` rules, the OWNERS
+ * write token, in their order: the `require_matching_label` rules, the CLA
+ * check, the OWNERS
  * labels, blunderbuss on a fresh pull request nobody reviews yet, the
  * approval, the pending runs of a pull request labeled `ok-to-test`, then the merge path (lgtm binding, mergeability, merge). Each
  * pull request is evaluated sequentially, a few pull requests at a time; a
@@ -150,6 +152,9 @@ async function sweepPullRequest(octokit: Octokit, context: Context, pr: PullsLis
   ]
   const steps: Step[] = [
     ['require-matching-label', () => enforceRequiredLabels(octokit, context, { issueNumber: pr.number, isPullRequest: true })],
+    ['cla', async () => {
+      await enforceCla(octokit, context, { number: pr.number, sha: pr.head.sha })
+    }],
     ...(hasOwners ? ownersSteps : []),
     ['ok-to-test', () => approveIfTrusted(octokit, context, pr)],
     ['tide', async () => {

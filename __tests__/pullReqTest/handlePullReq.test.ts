@@ -5,6 +5,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from 'vite
 import { okToTestOnPullRequest } from '../../src/issueComment/trigger'
 import { approveOnPullRequest } from '../../src/plugins/approve'
 import { blunderbuss } from '../../src/plugins/blunderbuss'
+import { claOnPullRequest } from '../../src/plugins/cla'
 import { lgtmOnPullRequest } from '../../src/plugins/lgtmBinding'
 import { ownersLabel } from '../../src/plugins/ownersLabel'
 import { requireMatchingLabel } from '../../src/plugins/requireMatchingLabel'
@@ -29,7 +30,7 @@ afterEach(() => server.resetHandlers())
 afterAll(() => server.close())
 
 it('registers require-matching-label, owners-label, blunderbuss, lgtm, approve, ok-to-test and tide, in that order', () => {
-  expect(registeredHandlers).toEqual([requireMatchingLabel, ownersLabel, blunderbuss, lgtmOnPullRequest, approveOnPullRequest, okToTestOnPullRequest, tideOnPullRequest])
+  expect(registeredHandlers).toEqual([requireMatchingLabel, claOnPullRequest, ownersLabel, blunderbuss, lgtmOnPullRequest, approveOnPullRequest, okToTestOnPullRequest, tideOnPullRequest])
 })
 
 // the lgtm PR job only acts on new commits; the fixture is an `opened` event

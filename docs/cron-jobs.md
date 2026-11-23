@@ -25,11 +25,12 @@ three at a time, each sequentially:
 Step | Reuses | Does | Skipped when
 --- | --- | --- | ---
 1 | [`require_matching_label`](./configuration.md#require_matching_label) | every PR rule, no grace period | no rule is configured
-2 | [`owners-label`](./labeling.md#labels-from-owners-files) | adds the missing OWNERS `labels:` | the repository has no OWNERS files
-3 | [`blunderbuss`](./configuration.md#blunderbuss) | requests reviewers like `opened` would; honours `ignore_authors` and `ignore_drafts` | no OWNERS files; the PR was created before the window; it has requested reviewers, reviews, or is a draft. With [`blunderbuss.delay`](./configuration.md#blunderbuss): the PR's review clock did not start inside the window shifted back by `delay`; it has requested reviewers or teams, or reviews
-4 | [`approve`](./commands.md#approve) | recomputes `approved` and the notifier | no OWNERS files
-5 | [`ok-to-test`](./commands.md#trigger) | approves the workflow runs waiting for approval on the head | the PR does not carry `ok-to-test`
-6 | [`tide`](./automatic-merging.md) | the label gate, the [`lgtm` binding](./automatic-merging.md#lgtm-is-bound-to-a-commit) (a stale `lgtm` is stripped), `mergeable_state`, the merge | never; `tide.merge_on_events` does not apply, the sweep is a scheduled job like `lgtm`
+2 | [`cla`](./configuration.md#cla) | checks the commit authors against the signatures, sets the `cla: yes`/`cla: no` label and the `prow/cla` status | `cla.signatures` is unset
+3 | [`owners-label`](./labeling.md#labels-from-owners-files) | adds the missing OWNERS `labels:` | the repository has no OWNERS files
+4 | [`blunderbuss`](./configuration.md#blunderbuss) | requests reviewers like `opened` would; honours `ignore_authors` and `ignore_drafts` | no OWNERS files; the PR was created before the window; it has requested reviewers, reviews, or is a draft. With [`blunderbuss.delay`](./configuration.md#blunderbuss): the PR's review clock did not start inside the window shifted back by `delay`; it has requested reviewers or teams, or reviews
+5 | [`approve`](./commands.md#approve) | recomputes `approved` and the notifier | no OWNERS files
+6 | [`ok-to-test`](./commands.md#trigger) | approves the workflow runs waiting for approval on the head | the PR does not carry `ok-to-test`
+7 | [`tide`](./automatic-merging.md) | the label gate, the [`lgtm` binding](./automatic-merging.md#lgtm-is-bound-to-a-commit) (a stale `lgtm` is stripped), `mergeable_state`, the merge | never; `tide.merge_on_events` does not apply, the sweep is a scheduled job like `lgtm`
 
 Same-repository pull requests are evaluated too; every step is idempotent, so the sweep
 changes nothing the events already did. The log has one `sweep: N candidates updated since

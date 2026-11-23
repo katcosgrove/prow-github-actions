@@ -3,7 +3,7 @@ import type { LabelValue, ProwConfig } from './config'
 import { okToTestLabel } from '../issueComment/trigger'
 import { legacyHoldLabel } from '../labels/hold'
 import { prefixedLabelCommands, sectionFor } from '../labels/prefixed'
-import { resolveHoldLabel } from './config'
+import { claLabels, resolveCla, resolveHoldLabel } from './config'
 
 /**
  * Colors and descriptions of the labels the action manages itself. They
@@ -31,7 +31,8 @@ const needsLabelColor = 'ededed'
  * sections (prefixed `<key>/<value>`, the `/label` allowlist verbatim), the
  * built-in `/lifecycle`, `/stage` and `/status` values where the yaml has no
  * section, the labels the action's own commands apply (`hold.label` and
- * the legacy `hold`, `ok-to-test`), and every `require_matching_label` missing label. Names are unique
+ * the legacy `hold`, `ok-to-test`), every `require_matching_label` missing label,
+ * and the two CLA labels when `cla.signatures` is set. Names are unique
  * case-insensitively (first definition wins) and sorted.
  *
  * @param config - the merged prow configuration
@@ -59,6 +60,14 @@ export function desiredLabels(config: ProwConfig): LabelValue[] {
   }
   for (const rule of config.require_matching_label) {
     labels.push({ name: rule.missing_label })
+  }
+  const cla = resolveCla(config.cla)
+  if (cla.signatures !== undefined) {
+    const { yes, no } = claLabels(cla)
+    labels.push(
+      { name: yes, color: 'bfe5bf', description: 'Every commit author of the PR has signed the CLA.' },
+      { name: no, color: 'e11d21', description: 'A commit author of the PR has not signed the CLA.' },
+    )
   }
 
   const seen = new Set<string>()

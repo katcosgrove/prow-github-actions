@@ -538,6 +538,7 @@ describe('mergeProwConfig', () => {
       lgtm: { bind_to_commit: false },
       sweep: {},
       authorization: {},
+      cla: {},
     })
   })
 
@@ -577,6 +578,6 @@ describe('mergeProwConfig', () => {
   })
 
   it('fills every section when both sides are empty', () => {
-    expect(mergeProwConfig({}, {})).toEqual({ labels: {}, require_matching_label: [], tide: {}, hold: {}, blunderbuss: {}, approve: {}, lgtm: {}, sweep: {}, authorization: {} })
+    expect(mergeProwConfig({}, {})).toEqual({ labels: {}, require_matching_label: [], tide: {}, hold: {}, blunderbuss: {}, approve: {}, lgtm: {}, sweep: {}, authorization: {}, cla: {} })
   })
 })

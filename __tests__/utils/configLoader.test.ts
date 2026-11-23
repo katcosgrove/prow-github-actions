@@ -228,6 +228,7 @@ describe('loadProwConfig', () => {
         lgtm: {},
         sweep: {},
         authorization: {},
+        cla: {},
         sources: [],
       })
     })
